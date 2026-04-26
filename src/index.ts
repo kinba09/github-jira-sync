@@ -5,6 +5,8 @@ import express, { type Request } from "express";
 import Arcade from "@arcadeai/arcadejs";
 import dotenv from "dotenv";
 import { z } from "zod";
+import { evaluatePolicyRules } from "./policy/evaluator";
+import { loadPolicyEngine } from "./policy/loader";
 
 dotenv.config();
 
@@ -111,7 +113,7 @@ type TrackedPullRequest = {
   latestPrUrl?: string;
   latestPrOpen?: boolean;
   latestJiraClosed?: boolean;
-  lastAlertState?: "pr_open_jira_closed" | "pr_closed_jira_open";
+  lastAlertState?: string;
   lastUpdatedAt: string;
 };
 
@@ -130,6 +132,10 @@ app.use(
 
 const state = loadMonitorState();
 const pendingTimers = new Map<string, NodeJS.Timeout>();
+const policyEngine = loadPolicyEngine(path.join(process.cwd(), "rules"));
+console.log(
+  `[policy] loaded ${policyEngine.rules.length} rule(s) from ${policyEngine.sourceFiles.join(", ") || "none"}`
+);
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
@@ -449,52 +455,37 @@ async function runConsistencyCheck(recordKey: string, reason: string): Promise<v
     lastUpdatedAt: new Date().toISOString()
   };
 
-  if (prOpen && jiraClosed) {
-    if (record.lastAlertState !== "pr_open_jira_closed") {
-      const alertMessage = buildSlackAlertMessage({
-        type: "pr_open_jira_closed",
-        issueKey: record.jiraIssueKey,
-        jiraStatusName: jiraStatus.name ?? "closed",
-        owner: record.owner,
-        repo: record.repo,
-        pullNumber: record.pullNumber,
-        prTitle: prDetails.title,
-        prUrl: prDetails.url,
-        reason
-      });
+  const policyActions = evaluatePolicyRules(policyEngine.rules, {
+    owner: record.owner,
+    repo: record.repo,
+    trigger: reason,
+    pr_open: prOpen,
+    jira_closed: jiraClosed,
+    jira_issue_key: record.jiraIssueKey,
+    jira_status_name: jiraStatus.name ?? "unknown",
+    pr_number: record.pullNumber,
+    pr_title: prDetails.title,
+    pr_url: prDetails.url
+  });
 
-      const alertResult = await sendSlackAlert(alertMessage);
-      if (!alertResult.needsAuthorization) {
-        console.log(`[slack] alert sent for ${recordKey}`);
-        updatedRecord.lastAlertState = "pr_open_jira_closed";
-      } else {
-        console.warn(`[slack] alert not sent for ${recordKey}: authorization pending`);
-      }
-    }
-  } else if (!prOpen && !jiraClosed) {
-    if (record.lastAlertState !== "pr_closed_jira_open") {
-      const alertMessage = buildSlackAlertMessage({
-        type: "pr_closed_jira_open",
-        issueKey: record.jiraIssueKey,
-        jiraStatusName: jiraStatus.name ?? "open",
-        owner: record.owner,
-        repo: record.repo,
-        pullNumber: record.pullNumber,
-        prTitle: prDetails.title,
-        prUrl: prDetails.url,
-        reason
-      });
-
-      const alertResult = await sendSlackAlert(alertMessage);
-      if (!alertResult.needsAuthorization) {
-        console.log(`[slack] alert sent for ${recordKey}`);
-        updatedRecord.lastAlertState = "pr_closed_jira_open";
-      } else {
-        console.warn(`[slack] alert not sent for ${recordKey}: authorization pending`);
-      }
-    }
-  } else {
+  if (policyActions.length === 0) {
     updatedRecord.lastAlertState = undefined;
+    updateTrackedPullRequest(recordKey, updatedRecord);
+    return;
+  }
+
+  for (const action of policyActions) {
+    if (action.alertState === record.lastAlertState) {
+      continue;
+    }
+
+    const alertResult = await sendSlackAlert(action.message);
+    if (!alertResult.needsAuthorization) {
+      console.log(`[slack] alert sent for ${recordKey} rule=${action.ruleId}`);
+      updatedRecord.lastAlertState = action.alertState;
+    } else {
+      console.warn(`[slack] alert not sent for ${recordKey}: authorization pending`);
+    }
   }
 
   updateTrackedPullRequest(recordKey, updatedRecord);
@@ -810,38 +801,6 @@ Pull Request created in GitHub for ${args.jiraIssueKey}
 - Branch: ${args.branchName}
 - Title: ${args.prTitle}
 - URL: ${args.prUrl}`;
-}
-
-function buildSlackAlertMessage(args: {
-  type: "pr_open_jira_closed" | "pr_closed_jira_open";
-  issueKey: string;
-  jiraStatusName: string;
-  owner: string;
-  repo: string;
-  pullNumber: number;
-  prTitle: string;
-  prUrl: string;
-  reason: string;
-}): string {
-  if (args.type === "pr_open_jira_closed") {
-    return [
-      ":warning: GitHub/Jira mismatch detected after 1 minute",
-      `- Jira issue: ${args.issueKey} is CLOSED (${args.jiraStatusName})`,
-      `- Pull request: ${args.owner}/${args.repo}#${args.pullNumber} is still OPEN`,
-      `- PR title: ${args.prTitle}`,
-      `- PR URL: ${args.prUrl}`,
-      `- Trigger: ${args.reason}`
-    ].join("\n");
-  }
-
-  return [
-    ":warning: GitHub/Jira mismatch detected after 1 minute",
-    `- Pull request: ${args.owner}/${args.repo}#${args.pullNumber} is CLOSED or MERGED`,
-    `- Jira issue: ${args.issueKey} is still OPEN (${args.jiraStatusName})`,
-    `- PR title: ${args.prTitle}`,
-    `- PR URL: ${args.prUrl}`,
-    `- Trigger: ${args.reason}`
-  ].join("\n");
 }
 
 function isGithubSignatureValid(request: RawBodyRequest, secret?: string): boolean {

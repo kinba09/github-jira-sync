@@ -1,0 +1,39 @@
+version: 1
+rules:
+  - id: pr-open-jira-closed
+    enabled: true
+    when:
+      trigger_in:
+        - github_pr_opened
+        - jira_issue_closed
+      pr_open: true
+      jira_closed: true
+    action:
+      type: slack_alert
+      alert_state: pr_open_jira_closed
+      message: |
+        :warning: GitHub/Jira mismatch detected after 1 minute
+        - Jira issue: {{jira_issue_key}} is CLOSED ({{jira_status_name}})
+        - Pull request: {{owner}}/{{repo}}#{{pr_number}} is still OPEN
+        - PR title: {{pr_title}}
+        - PR URL: {{pr_url}}
+        - Trigger: {{trigger}}
+
+  - id: pr-closed-jira-open
+    enabled: true
+    when:
+      trigger_in:
+        - github_pr_opened
+        - jira_issue_closed
+      pr_open: false
+      jira_closed: false
+    action:
+      type: slack_alert
+      alert_state: pr_closed_jira_open
+      message: |
+        :warning: GitHub/Jira mismatch detected after 1 minute
+        - Pull request: {{owner}}/{{repo}}#{{pr_number}} is CLOSED or MERGED
+        - Jira issue: {{jira_issue_key}} is still OPEN ({{jira_status_name}})
+        - PR title: {{pr_title}}
+        - PR URL: {{pr_url}}
+        - Trigger: {{trigger}}

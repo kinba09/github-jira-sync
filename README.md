@@ -1,10 +1,10 @@
 # GitHub PR -> Jira Comment + Slack Mismatch Alerts (Arcade + Docker)
 
-This backend does two things using Arcade tools:
+This backend does three things using Arcade tools:
 
 1. On GitHub PR opened, it comments on the Jira issue found in the branch name.
-2. It alerts Slack if Jira and PR states are inconsistent after 1 minute:
-   - PR is still open, but Jira issue is closed.
+2. It runs delayed consistency checks between GitHub and Jira.
+3. It applies Policy-as-Code rules from YAML to decide which Slack alerts to send.
 
 The 1-minute consistency check can be triggered by:
 - GitHub PR opened/reopened webhook
@@ -34,7 +34,17 @@ The 1-minute consistency check can be triggered by:
 1. Jira sends issue webhook to `/jira/webhook`
 2. If issue is closed, backend schedules 60s delayed check for linked PR records
 3. Backend re-checks PR + Jira via Arcade
-4. If PR open and Jira closed, backend sends Slack alert via Arcade
+4. Policy rules decide whether to send Slack alert via Arcade
+
+## Policy-as-Code
+
+- Rules are loaded from `rules/*.yaml` at startup.
+- Default policy file: `rules/default.yaml`.
+- Current default rules:
+  - `pr_open=true` and `jira_closed=true` -> alert (`pr_open_jira_closed`)
+  - `pr_open=false` and `jira_closed=false` -> alert (`pr_closed_jira_open`)
+- You can add repo-specific rules by creating more YAML files in `rules/`.
+- Message templates support placeholders like `{{jira_issue_key}}`, `{{pr_url}}`, `{{owner}}`, `{{repo}}`.
 
 ## Prerequisites
 
@@ -128,8 +138,8 @@ Jira -> `System` -> `Webhooks` -> `Create`
 5. Verify Slack alert appears.
 
 Also verify reverse trigger path:
-1. Keep PR open.
-2. Transition Jira issue to closed.
+1. Merge or close PR.
+2. Keep Jira issue open (for example `To Do`).
 3. Wait 60 seconds.
 4. Verify Slack alert appears.
 
