@@ -81,6 +81,66 @@ Defaults:
 - `ALERT_DELAY_SECONDS=60`
 - `JIRA_CLOSED_STATUS_KEYWORDS=done,closed,resolved`
 
+Multi-user optional:
+- `TENANTS_CONFIG_PATH=./tenants.json`
+- `ADMIN_API_TOKEN=<strong-secret>`
+- When enabled, tenant mappings override global routing for Arcade user, webhook validation, and Slack destination.
+
+## Multi-User Setup (No `.env` Key Loss)
+
+1. Keep your existing `.env` as-is (do not overwrite it).
+2. Copy tenant template:
+   - `cp tenants.example.json tenants.json`
+3. Edit `tenants.json` with each team/user:
+   - `id`
+   - `arcade_user_id`
+   - `github` owner/repo + webhook secret
+   - `jira` project key + webhook token
+   - `slack` destination
+4. Add in `.env`:
+   - `TENANTS_CONFIG_PATH=./tenants.json`
+5. Restart backend:
+   - `docker compose up --build -d`
+6. Verify tenants loaded:
+   - `curl http://localhost:3000/tenants`
+7. Tenant-specific auth check:
+   - `curl http://localhost:3000/auth/check/<tenant-id>`
+
+## Tenant Self-Onboarding API
+
+Use `x-admin-token: <ADMIN_API_TOKEN>` header.
+
+Create tenant:
+
+```bash
+curl -X POST http://localhost:3000/admin/tenants \
+  -H "Content-Type: application/json" \
+  -H "x-admin-token: <ADMIN_API_TOKEN>" \
+  -d '{
+    "id": "team-kan",
+    "arcade_user_id": "team-kan@example.com",
+    "github": [{ "owner": "kinba09", "repo": "My_mini_pytorch", "webhook_secret": "..." }],
+    "jira": { "project_keys": ["KAN"], "webhook_token": "..." },
+    "slack": { "conversation_id": "C0123456789" }
+  }'
+```
+
+Update tenant:
+
+```bash
+curl -X PUT http://localhost:3000/admin/tenants/team-kan \
+  -H "Content-Type: application/json" \
+  -H "x-admin-token: <ADMIN_API_TOKEN>" \
+  -d '<same JSON with updates>'
+```
+
+Delete tenant:
+
+```bash
+curl -X DELETE http://localhost:3000/admin/tenants/team-kan \
+  -H "x-admin-token: <ADMIN_API_TOKEN>"
+```
+
 ## 2. Run in Docker
 
 ```bash
@@ -147,6 +207,11 @@ Also verify reverse trigger path:
 
 - `GET /health`
 - `GET /auth/check`
+- `GET /auth/check/:tenantId`
+- `GET /tenants`
+- `POST /admin/tenants`
+- `PUT /admin/tenants/:tenantId`
+- `DELETE /admin/tenants/:tenantId`
 - `POST /webhook` (GitHub)
 - `POST /jira/webhook` (Jira)
 

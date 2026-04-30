@@ -1,0 +1,22 @@
+{
+  "tenants": [
+    {
+      "id": "team-kan",
+      "arcade_user_id": "team-kan@example.com",
+      "github": [
+        {
+          "owner": "kinba09",
+          "repo": "My_mini_pytorch",
+          "webhook_secret": "replace_with_github_webhook_secret"
+        }
+      ],
+      "jira": {
+        "project_keys": ["KAN"],
+        "webhook_token": "replace_with_jira_webhook_token"
+      },
+      "slack": {
+        "conversation_id": "C0123456789"
+      }
+    }
+  ]
+}

@@ -7,6 +7,12 @@ import dotenv from "dotenv";
 import { z } from "zod";
 import { evaluatePolicyRules } from "./policy/evaluator";
 import { loadPolicyEngine } from "./policy/loader";
+import {
+  type Tenant,
+  type TenantInput,
+  TenantRegistry,
+  resolveGithubWebhookSecretForTenant,
+} from "./tenancy";
 
 dotenv.config();
 
@@ -26,7 +32,9 @@ const envSchema = z
     ALERT_DELAY_SECONDS: z.coerce.number().int().positive().default(60),
     JIRA_CLOSED_STATUS_KEYWORDS: z.string().default("done,closed,resolved"),
     SLACK_ALERT_CHANNEL: z.string().optional(),
-    SLACK_ALERT_CONVERSATION_ID: z.string().optional()
+    SLACK_ALERT_CONVERSATION_ID: z.string().optional(),
+    TENANTS_CONFIG_PATH: z.string().optional(),
+    ADMIN_API_TOKEN: z.string().optional()
   })
   .refine((data) => Boolean(data.SLACK_ALERT_CHANNEL || data.SLACK_ALERT_CONVERSATION_ID), {
     message: "Set either SLACK_ALERT_CHANNEL or SLACK_ALERT_CONVERSATION_ID",
@@ -55,7 +63,9 @@ const config = {
     .map((item) => item.trim().toLowerCase())
     .filter(Boolean),
   slackAlertChannel: env.SLACK_ALERT_CHANNEL?.trim() || undefined,
-  slackAlertConversationId: env.SLACK_ALERT_CONVERSATION_ID?.trim() || undefined
+  slackAlertConversationId: env.SLACK_ALERT_CONVERSATION_ID?.trim() || undefined,
+  tenantsConfigPath: env.TENANTS_CONFIG_PATH?.trim() || undefined,
+  adminApiToken: env.ADMIN_API_TOKEN?.trim() || undefined
 };
 
 const issueKeyPattern = new RegExp(
@@ -104,6 +114,7 @@ type ToolExecutionResult =
 
 type TrackedPullRequest = {
   key: string;
+  tenantId: string;
   owner: string;
   repo: string;
   pullNumber: number;
@@ -133,6 +144,17 @@ app.use(
 const state = loadMonitorState();
 const pendingTimers = new Map<string, NodeJS.Timeout>();
 const policyEngine = loadPolicyEngine(path.join(process.cwd(), "rules"));
+const tenantRegistry = new TenantRegistry(config.tenantsConfigPath);
+console.log(`[tenancy] loaded ${tenantRegistry.list().length} tenant(s) from ${tenantRegistry.getPath()}`);
+const fallbackTenant: Tenant = {
+  id: "default",
+  arcadeUserId: config.arcadeUserId,
+  githubMappings: [],
+  jiraProjectKeys: [],
+  jiraWebhookToken: config.jiraWebhookToken,
+  slackChannelName: config.slackAlertChannel,
+  slackConversationId: config.slackAlertConversationId
+};
 console.log(
   `[policy] loaded ${policyEngine.rules.length} rule(s) from ${policyEngine.sourceFiles.join(", ") || "none"}`
 );
@@ -142,48 +164,86 @@ app.get("/health", (_req, res) => {
 });
 
 app.get("/auth/check", async (_req, res) => {
-  const toolNames = [
-    "Github.GetPullRequest",
-    "Github.ListPullRequests",
-    "Jira.GetIssueById",
-    "Jira.GetIssueComments",
-    "Jira.AddCommentToIssue",
-    "Slack.SendMessage"
-  ];
+  const tenant = fallbackTenant;
+  const result = await getAuthStatusesForTenant(tenant);
+  res.json(result);
+});
 
-  const authStatuses = await Promise.all(
-    toolNames.map(async (toolName) => {
-      try {
-        const auth = await arcade.tools.authorize({
-          tool_name: toolName,
-          user_id: config.arcadeUserId
-        });
+app.get("/auth/check/:tenantId", async (req, res) => {
+  const tenant = tenantRegistry.getById(req.params.tenantId);
+  if (!tenant) {
+    return res.status(404).json({ status: "not_found", reason: "tenant_not_found" });
+  }
 
-        return {
-          tool: toolName,
-          status: auth.status,
-          authorization_url: auth.status === "completed" ? null : auth.url ?? null
-        };
-      } catch (error) {
-        return {
-          tool: toolName,
-          status: "error",
-          error: toErrorMessage(error)
-        };
-      }
-    })
-  );
+  const result = await getAuthStatusesForTenant(tenant);
+  res.json(result);
+});
 
+app.get("/tenants", (_req, res) => {
   res.json({
-    user_id: config.arcadeUserId,
-    tools: authStatuses
+    tenants: tenantRegistry.list().map(formatTenantSummary)
   });
 });
 
-app.post("/webhook", async (req, res) => {
-  const webhookRequest = req as RawBodyRequest;
+app.post("/admin/tenants", (req, res) => {
+  if (!isAdminAuthorized(req)) {
+    return res.status(401).json({ status: "unauthorized", reason: "invalid_admin_token" });
+  }
 
-  if (!isGithubSignatureValid(webhookRequest, config.githubWebhookSecret)) {
+  try {
+    const created = tenantRegistry.create(req.body as TenantInput);
+    return res.status(201).json({ status: "ok", tenant: formatTenantSummary(created) });
+  } catch (error) {
+    return res.status(400).json({ status: "bad_request", reason: toErrorMessage(error) });
+  }
+});
+
+app.put("/admin/tenants/:tenantId", (req, res) => {
+  if (!isAdminAuthorized(req)) {
+    return res.status(401).json({ status: "unauthorized", reason: "invalid_admin_token" });
+  }
+
+  try {
+    const updated = tenantRegistry.update(req.params.tenantId, req.body as TenantInput);
+    return res.status(200).json({ status: "ok", tenant: formatTenantSummary(updated) });
+  } catch (error) {
+    const message = toErrorMessage(error);
+    const isMissing = message.includes("was not found");
+    return res.status(isMissing ? 404 : 400).json({ status: "error", reason: message });
+  }
+});
+
+app.delete("/admin/tenants/:tenantId", (req, res) => {
+  if (!isAdminAuthorized(req)) {
+    return res.status(401).json({ status: "unauthorized", reason: "invalid_admin_token" });
+  }
+
+  const deleted = tenantRegistry.delete(req.params.tenantId);
+  if (!deleted) {
+    return res.status(404).json({ status: "not_found", reason: "tenant_not_found" });
+  }
+
+  return res.status(200).json({ status: "ok", deleted: req.params.tenantId });
+});
+
+app.post("/webhook", async (req, res) => {
+  const payloadResult = pullRequestEventSchema.safeParse(req.body);
+  if (!payloadResult.success) {
+    return res.status(400).json({ status: "bad_request", reason: "invalid_payload" });
+  }
+
+  const payload = payloadResult.data;
+  const owner = payload.repository.owner.login;
+  const repo = payload.repository.name;
+  const tenant = tenantRegistry.resolveForGithub(owner, repo) ?? fallbackTenant;
+
+  const webhookRequest = req as RawBodyRequest;
+  const tenantGithubSecret =
+    tenant.id === "default"
+      ? config.githubWebhookSecret
+      : resolveGithubWebhookSecretForTenant(tenant, owner, repo) ?? config.githubWebhookSecret;
+
+  if (!isGithubSignatureValid(webhookRequest, tenantGithubSecret)) {
     return res.status(401).json({ status: "unauthorized", reason: "invalid_signature" });
   }
 
@@ -192,24 +252,17 @@ app.post("/webhook", async (req, res) => {
     return res.status(200).json({ status: "ignored", reason: "unsupported_event" });
   }
 
-  const payloadResult = pullRequestEventSchema.safeParse(req.body);
-  if (!payloadResult.success) {
-    return res.status(400).json({ status: "bad_request", reason: "invalid_payload" });
-  }
-
-  const payload = payloadResult.data;
   const { action } = payload;
-  console.log(`[github] event=pull_request action=${action}`);
+  console.log(`[github] tenant=${tenant.id} event=pull_request action=${action}`);
 
-  const owner = payload.repository.owner.login;
-  const repo = payload.repository.name;
   const prNumber = payload.pull_request.number;
   const branchName = payload.pull_request.head.ref;
-  const recordKey = buildRecordKey(owner, repo, prNumber);
+  const recordKey = buildRecordKey(tenant.id, owner, repo, prNumber);
 
   if (action === "closed") {
     updateTrackedPullRequest(recordKey, {
       key: recordKey,
+      tenantId: tenant.id,
       owner,
       repo,
       pullNumber: prNumber,
@@ -235,6 +288,7 @@ app.post("/webhook", async (req, res) => {
 
   updateTrackedPullRequest(recordKey, {
     key: recordKey,
+    tenantId: tenant.id,
     owner,
     repo,
     pullNumber: prNumber,
@@ -245,19 +299,24 @@ app.post("/webhook", async (req, res) => {
     latestPrOpen: true,
     lastUpdatedAt: new Date().toISOString()
   });
-  console.log(`[github] tracked ${recordKey} issue=${jiraIssueKey}`);
+  console.log(`[github] tenant=${tenant.id} tracked ${recordKey} issue=${jiraIssueKey}`);
 
   try {
-    const prResult = await executeTool("Github.GetPullRequest", {
-      owner,
-      repo,
-      pull_number: prNumber
-    });
+    const prResult = await executeTool(
+      "Github.GetPullRequest",
+      {
+        owner,
+        repo,
+        pull_number: prNumber
+      },
+      tenant.arcadeUserId
+    );
 
     if (prResult.needsAuthorization) {
       return res.status(202).json({
         status: "pending_authorization",
         tool: "Github.GetPullRequest",
+        tenant_id: tenant.id,
         authorization_url: prResult.authorizationUrl ?? null
       });
     }
@@ -269,6 +328,7 @@ app.post("/webhook", async (req, res) => {
 
     updateTrackedPullRequest(recordKey, {
       key: recordKey,
+      tenantId: tenant.id,
       owner,
       repo,
       pullNumber: prNumber,
@@ -280,16 +340,21 @@ app.post("/webhook", async (req, res) => {
       lastUpdatedAt: new Date().toISOString()
     });
 
-    const commentsResult = await executeTool("Jira.GetIssueComments", {
-      issue: jiraIssueKey,
-      limit: 100,
-      order_by: "created_date_descending"
-    });
+    const commentsResult = await executeTool(
+      "Jira.GetIssueComments",
+      {
+        issue: jiraIssueKey,
+        limit: 100,
+        order_by: "created_date_descending"
+      },
+      tenant.arcadeUserId
+    );
 
     if (commentsResult.needsAuthorization) {
       return res.status(202).json({
         status: "pending_authorization",
         tool: "Jira.GetIssueComments",
+        tenant_id: tenant.id,
         authorization_url: commentsResult.authorizationUrl ?? null
       });
     }
@@ -313,25 +378,31 @@ app.post("/webhook", async (req, res) => {
         prUrl: prDetails.url
       });
 
-      const addCommentResult = await executeTool("Jira.AddCommentToIssue", {
-        issue: jiraIssueKey,
-        body: commentBody
-      });
+      const addCommentResult = await executeTool(
+        "Jira.AddCommentToIssue",
+        {
+          issue: jiraIssueKey,
+          body: commentBody
+        },
+        tenant.arcadeUserId
+      );
 
       if (addCommentResult.needsAuthorization) {
         return res.status(202).json({
           status: "pending_authorization",
           tool: "Jira.AddCommentToIssue",
+          tenant_id: tenant.id,
           authorization_url: addCommentResult.authorizationUrl ?? null
         });
       }
     }
 
     scheduleConsistencyCheck(recordKey, "github_pr_opened");
-    console.log(`[github] scheduled check for ${recordKey} in ${config.alertDelayMs / 1000}s`);
+    console.log(`[github] tenant=${tenant.id} scheduled check for ${recordKey} in ${config.alertDelayMs / 1000}s`);
 
     return res.status(200).json({
       status: "ok",
+      tenant_id: tenant.id,
       issue: jiraIssueKey,
       pr: prNumber,
       scheduled_check_in_seconds: config.alertDelayMs / 1000
@@ -343,45 +414,93 @@ app.post("/webhook", async (req, res) => {
 });
 
 app.post("/jira/webhook", (req, res) => {
-  if (!isJiraWebhookAuthorized(req as RawBodyRequest, config.jiraWebhookToken)) {
-    console.warn("[jira] unauthorized webhook request");
-    return res.status(401).json({ status: "unauthorized", reason: "invalid_jira_token" });
-  }
-
   const issueKey = extractIssueKeyFromJiraWebhook(req.body);
   if (!issueKey) {
     console.log("[jira] ignored webhook: no issue key");
     return res.status(200).json({ status: "ignored", reason: "no_issue_key" });
   }
 
+  const tenant = tenantRegistry.resolveForJiraIssue(issueKey) ?? fallbackTenant;
+  const tenantJiraToken = tenant.id === "default" ? config.jiraWebhookToken : tenant.jiraWebhookToken;
+
+  if (!isJiraWebhookAuthorized(req as RawBodyRequest, tenantJiraToken)) {
+    console.warn(`[jira] tenant=${tenant.id} unauthorized webhook request`);
+    return res.status(401).json({ status: "unauthorized", reason: "invalid_jira_token" });
+  }
+
   const isClosedFromPayload = extractJiraClosedFromWebhook(req.body);
   if (!isClosedFromPayload) {
-    console.log(`[jira] ignored webhook for ${issueKey}: status is not closed`);
+    console.log(`[jira] tenant=${tenant.id} ignored webhook for ${issueKey}: status is not closed`);
     return res.status(200).json({ status: "ignored", reason: "issue_not_closed" });
   }
-  console.log(`[jira] closed event received for issue=${issueKey}`);
+  console.log(`[jira] tenant=${tenant.id} closed event received for issue=${issueKey}`);
 
   const relatedRecords = Object.values(state.trackedPullRequests).filter(
-    (record) => record.jiraIssueKey === issueKey
+    (record) => record.tenantId === tenant.id && record.jiraIssueKey === issueKey
   );
 
   if (relatedRecords.length === 0) {
-    console.log(`[jira] no related tracked PRs for issue=${issueKey}`);
+    console.log(`[jira] tenant=${tenant.id} no related tracked PRs for issue=${issueKey}`);
     return res.status(200).json({ status: "ok", reason: "no_related_pr_records", issue: issueKey });
   }
 
   for (const record of relatedRecords) {
     scheduleConsistencyCheck(record.key, "jira_issue_closed");
-    console.log(`[jira] scheduled check for ${record.key} in ${config.alertDelayMs / 1000}s`);
+    console.log(`[jira] tenant=${tenant.id} scheduled check for ${record.key} in ${config.alertDelayMs / 1000}s`);
   }
 
   return res.status(200).json({
     status: "ok",
+    tenant_id: tenant.id,
     issue: issueKey,
     scheduled_checks: relatedRecords.length,
     scheduled_check_in_seconds: config.alertDelayMs / 1000
   });
 });
+
+async function getAuthStatusesForTenant(tenant: Tenant): Promise<{
+  tenant_id: string;
+  user_id: string;
+  tools: Array<{ tool: string; status: string; authorization_url?: string | null; error?: string }>;
+}> {
+  const toolNames = [
+    "Github.GetPullRequest",
+    "Github.ListPullRequests",
+    "Jira.GetIssueById",
+    "Jira.GetIssueComments",
+    "Jira.AddCommentToIssue",
+    "Slack.SendMessage"
+  ];
+
+  const authStatuses = await Promise.all(
+    toolNames.map(async (toolName) => {
+      try {
+        const auth = await arcade.tools.authorize({
+          tool_name: toolName,
+          user_id: tenant.arcadeUserId
+        });
+
+        return {
+          tool: toolName,
+          status: auth.status ?? "unknown",
+          authorization_url: auth.status === "completed" ? null : auth.url ?? null
+        };
+      } catch (error) {
+        return {
+          tool: toolName,
+          status: "error",
+          error: toErrorMessage(error)
+        };
+      }
+    })
+  );
+
+  return {
+    tenant_id: tenant.id,
+    user_id: tenant.arcadeUserId,
+    tools: authStatuses
+  };
+}
 
 function scheduleConsistencyCheck(recordKey: string, reason: string): void {
   const existing = pendingTimers.get(recordKey);
@@ -410,11 +529,17 @@ async function runConsistencyCheck(recordKey: string, reason: string): Promise<v
     return;
   }
 
-  const prResult = await executeTool("Github.GetPullRequest", {
-    owner: record.owner,
-    repo: record.repo,
-    pull_number: record.pullNumber
-  });
+  const tenant = tenantRegistry.getById(record.tenantId) ?? fallbackTenant;
+
+  const prResult = await executeTool(
+    "Github.GetPullRequest",
+    {
+      owner: record.owner,
+      repo: record.repo,
+      pull_number: record.pullNumber
+    },
+    tenant.arcadeUserId
+  );
 
   if (prResult.needsAuthorization) {
     console.warn(
@@ -429,9 +554,13 @@ async function runConsistencyCheck(recordKey: string, reason: string): Promise<v
   });
   const prOpen = extractPrOpenState(prResult.output);
 
-  const jiraIssueResult = await executeTool("Jira.GetIssueById", {
-    issue: record.jiraIssueKey
-  });
+  const jiraIssueResult = await executeTool(
+    "Jira.GetIssueById",
+    {
+      issue: record.jiraIssueKey
+    },
+    tenant.arcadeUserId
+  );
 
   if (jiraIssueResult.needsAuthorization) {
     console.warn(
@@ -479,7 +608,7 @@ async function runConsistencyCheck(recordKey: string, reason: string): Promise<v
       continue;
     }
 
-    const alertResult = await sendSlackAlert(action.message);
+    const alertResult = await sendSlackAlert(action.message, tenant);
     if (!alertResult.needsAuthorization) {
       console.log(`[slack] alert sent for ${recordKey} rule=${action.ruleId}`);
       updatedRecord.lastAlertState = action.alertState;
@@ -491,34 +620,43 @@ async function runConsistencyCheck(recordKey: string, reason: string): Promise<v
   updateTrackedPullRequest(recordKey, updatedRecord);
 }
 
-async function sendSlackAlert(message: string): Promise<ToolExecutionResult> {
+async function sendSlackAlert(message: string, tenant: Tenant): Promise<ToolExecutionResult> {
   console.log(
     `[slack] sending alert to ${
-      config.slackAlertConversationId
-        ? `conversation_id=${config.slackAlertConversationId}`
-        : `channel_name=${config.slackAlertChannel}`
+      tenant.slackConversationId
+        ? `conversation_id=${tenant.slackConversationId}`
+        : `channel_name=${tenant.slackChannelName}`
     }`
   );
-  if (config.slackAlertConversationId) {
-    return executeTool("Slack.SendMessage", {
-      conversation_id: config.slackAlertConversationId,
-      message
-    });
+  if (tenant.slackConversationId) {
+    return executeTool(
+      "Slack.SendMessage",
+      {
+        conversation_id: tenant.slackConversationId,
+        message
+      },
+      tenant.arcadeUserId
+    );
   }
 
-  return executeTool("Slack.SendMessage", {
-    channel_name: config.slackAlertChannel,
-    message
-  });
+  return executeTool(
+    "Slack.SendMessage",
+    {
+      channel_name: tenant.slackChannelName,
+      message
+    },
+    tenant.arcadeUserId
+  );
 }
 
 async function executeTool(
   toolName: string,
-  input: Record<string, unknown>
+  input: Record<string, unknown>,
+  arcadeUserId: string
 ): Promise<ToolExecutionResult> {
   const auth = await arcade.tools.authorize({
     tool_name: toolName,
-    user_id: config.arcadeUserId
+    user_id: arcadeUserId
   });
 
   if (auth.status !== "completed") {
@@ -532,7 +670,7 @@ async function executeTool(
   const response = await arcade.tools.execute({
     tool_name: toolName,
     input,
-    user_id: config.arcadeUserId
+    user_id: arcadeUserId
   });
 
   return {
@@ -771,8 +909,31 @@ function extractJiraClosedFromWebhook(payload: unknown): boolean {
   );
 }
 
-function buildRecordKey(owner: string, repo: string, prNumber: number): string {
-  return `${owner}/${repo}#${prNumber}`;
+function buildRecordKey(tenantId: string, owner: string, repo: string, prNumber: number): string {
+  return `${tenantId}::${owner}/${repo}#${prNumber}`;
+}
+
+function formatTenantSummary(tenant: Tenant): {
+  id: string;
+  arcade_user_id: string;
+  github_repos: string[];
+  jira_project_keys: string[];
+} {
+  return {
+    id: tenant.id,
+    arcade_user_id: tenant.arcadeUserId,
+    github_repos: tenant.githubMappings.map((mapping) => `${mapping.owner}/${mapping.repo}`),
+    jira_project_keys: tenant.jiraProjectKeys
+  };
+}
+
+function isAdminAuthorized(req: Request): boolean {
+  if (!config.adminApiToken) {
+    return false;
+  }
+
+  const token = req.header("x-admin-token");
+  return token === config.adminApiToken;
 }
 
 function extractJiraIssueKey(branchName: string): string | null {
